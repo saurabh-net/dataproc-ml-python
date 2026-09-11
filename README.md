@@ -24,6 +24,61 @@ pip install dataproc-ml
 
 Here are a couple of examples demonstrating how to use the handlers for distributed inference on a Spark DataFrame.
 
+### AI Functions: `ai_generate`
+
+> **Note:** `ai_generate` makes API calls to Vertex AI, which will incur costs.
+> Please review the [Vertex AI Generative
+> AI pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing).
+
+`ai_generate` is a Spark column function that calls a Gemini model on every
+row, mirroring the semantics of BigQuery's
+[`AI.GENERATE`](https://cloud.google.com/bigquery/docs/reference/standard-sql/AI-functions#ai.generate).
+It returns a `STRUCT` with a `result`, the raw `full_response`, and a `status`
+that is empty on success.
+
+```python
+from pyspark.sql import SparkSession, functions as F
+from google.cloud.dataproc_ml.sql import ai_generate
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.createDataFrame([("Paris",), ("Tokyo",)], ["city"])
+
+result_df = df.withColumn(
+    "generated",
+    ai_generate(F.concat(F.lit("Airport code for "), F.col("city"))),
+).select("city", "generated.result", "generated.status")
+
+result_df.show()
+# +-----+------+------+
+# | city|result|status|
+# +-----+------+------+
+# |Paris|   CDG|      |
+# |Tokyo|   HND|      |
+# +-----+------+------+
+```
+
+Pass `output_schema` to get typed columns back instead of a single string:
+
+```python
+df.withColumn(
+    "review",
+    ai_generate(
+        F.col("text"),
+        output_schema="sentiment STRING, score FLOAT64",
+    ),
+)
+```
+
+The same function can be registered for use from Spark SQL:
+
+```python
+from google.cloud.dataproc_ml.sql import ai_generate_udf
+
+spark.udf.register("ai_generate", ai_generate_udf())
+spark.sql("SELECT ai_generate('Airport code for Paris').result").show()
+```
+
 ### Generative AI (Gemini) Model Inference
 
 > **Note:** Using the `GenAiModelHandler` involves making API calls to 

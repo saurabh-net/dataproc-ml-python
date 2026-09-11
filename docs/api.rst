@@ -7,3 +7,7 @@ in the ``dataproc-ml`` library.
 .. automodule:: google.cloud.dataproc_ml.inference
    :members:
    :show-inheritance:
+
+.. automodule:: google.cloud.dataproc_ml.sql
+   :members:
+   :show-inheritance:
