@@ -66,6 +66,27 @@ class TestParsing(OutputSchemaTestCase):
         self.assertIsInstance(self.field_type(struct, "c"), DoubleType)
         self.assertIsInstance(self.field_type(struct, "d"), BooleanType)
 
+    def test_a_field_named_after_a_type_keeps_its_name(self):
+        # Rewriting BigQuery type names must not touch the field names, or
+        # "int64 INT64" would silently declare a field called BIGINT.
+        struct = _output_schema.parse_output_schema(
+            "int64 INT64, bool BOOL, float64 FLOAT64"
+        )
+        self.assertEqual(self.field_names(struct), ["bool", "float64", "int64"])
+        self.assertIsInstance(self.field_type(struct, "int64"), LongType)
+        self.assertIsInstance(self.field_type(struct, "bool"), BooleanType)
+        self.assertIsInstance(self.field_type(struct, "float64"), DoubleType)
+
+    def test_a_type_keeps_its_modifiers(self):
+        for schema in (
+            "a INT64 NOT NULL",
+            "a INT64 COMMENT 'how many'",
+            "a INT64 NOT NULL, b BOOL",
+        ):
+            with self.subTest(schema=schema):
+                struct = _output_schema.parse_output_schema(schema)
+                self.assertIsInstance(self.field_type(struct, "a"), LongType)
+
     def test_arrays_and_structs_are_supported(self):
         struct = _output_schema.parse_output_schema(
             "tags ARRAY<STRING>, location STRUCT<city: STRING, zip: INT64>"

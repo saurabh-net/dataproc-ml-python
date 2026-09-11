@@ -43,6 +43,24 @@ _TYPE_ALIASES = {
     "BOOL": "BOOLEAN",
 }
 
+# An alias is only rewritten where a type may appear, which is recognized by
+# what surrounds it. Matching the bare name would also rewrite a *field* named
+# after a type: "int64 INT64" would become "BIGINT BIGINT", quietly renaming
+# the field to BIGINT instead of failing. A type is preceded by a space, a
+# colon or "<", and is followed by the end of the field or by one of the
+# modifiers that Spark allows after a type.
+_ALIAS_PATTERNS = tuple(
+    (
+        re.compile(
+            rf"(?<=[\s:<]){bigquery_name}"
+            r"(?=\s*(?:,|>|\)|$|NOT\s+NULL|COMMENT\b))",
+            re.IGNORECASE,
+        ),
+        spark_name,
+    )
+    for bigquery_name, spark_name in _TYPE_ALIASES.items()
+)
+
 # Matches the field options syntax that BigQuery supports but this library does
 # not parse yet, e.g. ``OPTIONS(description = '...')``.
 _OPTIONS_PATTERN = re.compile(r"\bOPTIONS\s*\(", re.IGNORECASE)
@@ -105,13 +123,8 @@ def _parse_ddl(output_schema: str) -> StructType:
         )
 
     normalized = output_schema
-    for bigquery_name, spark_name in _TYPE_ALIASES.items():
-        normalized = re.sub(
-            rf"\b{bigquery_name}\b",
-            spark_name,
-            normalized,
-            flags=re.IGNORECASE,
-        )
+    for pattern, spark_name in _ALIAS_PATTERNS:
+        normalized = pattern.sub(spark_name, normalized)
 
     try:
         parsed = StructType.fromDDL(normalized)

@@ -20,7 +20,13 @@ from unittest import mock
 from google.genai import errors, types
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as sf
-from pyspark.sql.types import LongType, StringType, StructField, StructType
+from pyspark.sql.types import (
+    BooleanType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+)
 
 # pylint: disable=ungrouped-imports
 from google.cloud.dataproc_ml.sql import _ai_generate as ai_generate_module
@@ -265,6 +271,18 @@ class TestGenerateOneRow(SparkTestCase):
                 self.assertEqual(row["status"], "")
         self.assertEqual(called, [])
 
+    def test_a_non_string_prompt_is_rendered_as_text(self):
+        # Spark SQL can call the registered function on any column, and no
+        # cast is inserted there. Such a value must reach the model as text
+        # rather than be mistaken for a null. A whole number carried as a
+        # float, which is how Arrow delivers a nullable integer column, keeps
+        # its integer spelling.
+        cases = ((42, "42"), (2.0, "2"), (3.5, "3.5"), (True, "True"))
+        for prompt, expected in cases:
+            with self.subTest(prompt=prompt):
+                row = self._run(answers_the_prompt(), prompt=prompt)
+                self.assertEqual(row["result"], f"answer to {expected}")
+
     def test_transient_errors_are_retried_then_succeed(self):
         row = self._run(
             replies_with(
@@ -329,6 +347,33 @@ class TestGenerateOneRow(SparkTestCase):
         self.assertEqual(row["score"], 5)
         self.assertEqual(row["status"], "")
         self.assertNotIn("result", row)
+
+    def test_a_boolean_field_reads_the_answer(self):
+        schema = StructType([StructField("spam", BooleanType())])
+        # A tuple rather than a dict: True and 1 are the same dictionary key.
+        cases = (
+            (True, True),
+            (False, False),
+            # A model that answers with text rather than a JSON boolean.
+            ("true", True),
+            ("false", False),
+            ("False", False),
+            ("no", False),
+            (1, True),
+            (0, False),
+            # Nothing sensible to read, so the field is null.
+            ("perhaps", None),
+            ([], None),
+        )
+        for answer, expected in cases:
+            with self.subTest(answer=answer):
+                row = self._run(
+                    replies_with(
+                        response_with_text(json.dumps({"spam": answer}))
+                    ),
+                    schema=schema,
+                )
+                self.assertIs(row["spam"], expected)
 
     def test_unparsable_structured_output_is_reported(self):
         schema = StructType([StructField("sentiment", StringType())])
@@ -477,6 +522,25 @@ class TestSparkExecution(SparkTestCase):
             city = row["city"]
             self.assertEqual(row["answer"], f"answer to {city}")
             self.assertEqual(row["status"], "")
+
+    def test_a_non_string_column_works_in_spark_sql(self):
+        # Spark SQL applies the registered function to the column as declared,
+        # with no cast inserted, so the worker has to render the value.
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=answers_the_prompt()),
+        )
+        numbers = self.spark.createDataFrame([(1,), (2,), (None,)], "n: bigint")
+        numbers.createOrReplaceTempView("numbers")
+
+        rows = self.spark.sql(
+            "SELECT n, ai_generate(n).result AS answer FROM numbers"
+        ).collect()
+
+        answers = {row["n"]: row["answer"] for row in rows}
+        self.assertEqual(answers[1], "answer to 1")
+        self.assertEqual(answers[2], "answer to 2")
+        self.assertIsNone(answers[None])
 
     def test_failed_rows_do_not_fail_the_query(self):
         result = self.df.withColumn(

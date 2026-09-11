@@ -69,6 +69,12 @@ _RESULT_FIELD = "result"
 _FULL_RESPONSE_FIELD = "full_response"
 _STATUS_FIELD = "status"
 
+# Spellings accepted when a BOOL field comes back as text rather than as a
+# JSON boolean. Anything else is treated as an answer that does not fit the
+# schema and becomes null.
+_TRUE_WORDS = frozenset({"true", "t", "yes", "y", "1"})
+_FALSE_WORDS = frozenset({"false", "f", "no", "n", "0"})
+
 PromptArg = Union[Column, str, Sequence[Union[Column, str]]]
 
 
@@ -335,10 +341,17 @@ async def _generate_one(
         # A null prompt produces a null result without calling the model.
         return _row(schema, result=None, full_response=None, status="")
 
+    # ``ai_generate`` casts its prompt column to STRING on the driver, but the
+    # function returned by ``ai_generate_udf`` can also be registered and
+    # called straight from Spark SQL, where no such cast is inserted. Render
+    # the value here so that a non-string column, say an id, still produces a
+    # prompt rather than being dropped.
+    text = _to_text(prompt)
+
     for attempt in range(_MAX_ATTEMPTS):
         try:
             response = await generate_content(
-                model=endpoint, contents=prompt, config=config
+                model=endpoint, contents=text, config=config
             )
             return _to_row(response, schema)
         except Exception as e:  # pylint: disable=broad-except
@@ -376,13 +389,28 @@ async def _generate_one(
 def _is_missing(prompt: Any) -> bool:
     """Reports whether a prompt is null.
 
-    Spark nulls arrive as ``None`` or, in a numeric batch, as NaN.
+    Spark nulls arrive as ``None``, as NaN in a numeric batch, or as
+    ``pandas.NA`` from a nullable column. Every other value, including a
+    number or a timestamp, is a real prompt that the caller renders as text.
     """
-    if prompt is None:
+    if prompt is None or prompt is pd.NA:
         return True
-    if isinstance(prompt, float) and math.isnan(prompt):
-        return True
-    return not isinstance(prompt, str)
+    return isinstance(prompt, float) and math.isnan(prompt)
+
+
+def _to_text(prompt: Any) -> str:
+    """Renders a prompt that Spark has not already cast to a string.
+
+    A whole number is rendered without a fraction. Arrow hands a nullable
+    integer column to pandas as floats, so a BIGINT 2 arrives here as 2.0 as
+    soon as any row in the batch is null. Rendering that as "2.0" would let
+    one row's prompt depend on whether an unrelated row happened to be null.
+    """
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, float) and float(prompt).is_integer():
+        return str(int(prompt))
+    return str(prompt)
 
 
 def _to_row(response, schema: Optional[StructType]) -> Dict[str, Any]:
@@ -498,7 +526,7 @@ def _coerce(value: Any, data_type: DataType) -> Any:
         if isinstance(data_type, StringType):
             return value if isinstance(value, str) else json.dumps(value)
         if isinstance(data_type, BooleanType):
-            return bool(value)
+            return _to_boolean(value)
         if isinstance(data_type, (LongType, IntegerType)):
             return int(value)
         if isinstance(data_type, (DoubleType, FloatType)):
@@ -516,4 +544,27 @@ def _coerce(value: Any, data_type: DataType) -> Any:
             }
     except (TypeError, ValueError):
         return None
+    return None
+
+
+def _to_boolean(value: Any) -> Optional[bool]:
+    """Converts a JSON value to a boolean.
+
+    ``bool()`` on its own is wrong here, because every non-empty string is
+    truthy: a model answering with the text "false" would be recorded as True.
+    A value that does not clearly denote a boolean becomes null, which is how
+    the rest of this module reports an answer that does not fit the requested
+    schema.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in _TRUE_WORDS:
+            return True
+        if text in _FALSE_WORDS:
+            return False
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
     return None
