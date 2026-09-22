@@ -143,7 +143,10 @@ class TestOutput(unittest.TestCase):
             _ddl.parse_response_schema("a STRING, b INT"),
             {
                 "type": "OBJECT",
-                "properties": {"a": {"type": "STRING"}, "b": {"type": "INTEGER"}},
+                "properties": {
+                    "a": {"type": "STRING"},
+                    "b": {"type": "INTEGER"},
+                },
             },
         )
 
@@ -152,7 +155,10 @@ class TestOutput(unittest.TestCase):
             _ddl.parse_response_schema("a STRING NOT NULL, b INT"),
             {
                 "type": "OBJECT",
-                "properties": {"a": {"type": "STRING"}, "b": {"type": "INTEGER"}},
+                "properties": {
+                    "a": {"type": "STRING"},
+                    "b": {"type": "INTEGER"},
+                },
                 "required": ["a"],
             },
         )

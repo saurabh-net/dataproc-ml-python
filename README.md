@@ -30,6 +30,9 @@ Here are a couple of examples demonstrating how to use the handlers for distribu
 > Please review the [Vertex AI Generative
 > AI pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing).
 
+> **Note:** The AI functions require Apache Spark 4.0 or later. Named arguments
+> in Spark SQL, which the call style below relies on, do not exist before it.
+
 `ai_generate` is a Spark column function that calls a Gemini model on every
 row. It always returns the same struct, whatever the arguments:
 
@@ -37,10 +40,12 @@ row. It always returns the same struct, whatever the arguments:
 STRUCT<result STRING, full_response STRING, status STRING>
 ```
 
-`result` is the generated text, `full_response` is the whole model response as
-JSON, and `status` is `SUCCESS`, `RATE_LIMITED`, `SAFETY_BLOCKED`, or a
-description of the error. A row that fails reports it in `status` rather than
-failing the query.
+`result` is the generated text, and `full_response` is the whole model response
+as JSON. `status` is empty when the row succeeded and otherwise describes the
+failure, led by its canonical error code, so `WHERE status <> ''` collects the
+rows that need attention. A row that fails reports it in `status` rather than
+failing the query; a mistake in the *call*, such as a misspelled model, fails
+the query immediately instead.
 
 ```python
 from pyspark.sql import SparkSession, functions as F
@@ -56,12 +61,12 @@ result_df = df.withColumn(
 ).select("city", "generated.result", "generated.status")
 
 result_df.show()
-# +-----+------+-------+
-# | city|result| status|
-# +-----+------+-------+
-# |Paris|   CDG|SUCCESS|
-# |Tokyo|   HND|SUCCESS|
-# +-----+------+-------+
+# +-----+------+------+
+# | city|result|status|
+# +-----+------+------+
+# |Paris|   CDG|      |
+# |Tokyo|   HND|      |
+# +-----+------+------+
 ```
 
 Pass `output_schema` as a Spark DDL string to constrain the model to a shape.
@@ -88,6 +93,33 @@ ai_generate(
 )
 ```
 
+`endpoint`, `model_params` and `output_schema` configure the call rather than
+the row, so they have to be constant for the query. `prompt` is the argument
+that varies.
+
+#### Prompts that include a file
+
+A prompt can mix text and files. Vertex AI reads the file itself, so nothing is
+downloaded into Spark, and the media type is inferred from the file extension
+unless you give it:
+
+```python
+from google.cloud.dataproc_ml.sql import ai_generate, file
+
+invoices.withColumn(
+    "extracted",
+    ai_generate(
+        [F.lit("Extract the invoice details."), file(F.col("uri"))],
+        output_schema="invoice_number STRING, total DOUBLE",
+    ),
+)
+```
+
+As with `prompt`, a plain string passed to `file` names a *column*; wrap a
+literal path in `F.lit`.
+
+#### Spark SQL
+
 The same function can be registered for use from Spark SQL, where the model
 settings are ordinary arguments and may be passed by name in any order:
 
@@ -104,6 +136,23 @@ spark.sql("""
     ).result
     FROM cities
 """).show()
+```
+
+In SQL a prompt is either a string or a struct whose fields are, in order, the
+parts of the prompt. A field holding `named_struct('uri', ...)` is a file, and
+a top-level `named_struct('uri', ...)` is itself a single file:
+
+```sql
+SELECT g.result
+FROM (
+    SELECT ai_generate(
+        prompt => struct('Extract the invoice details.',
+                         named_struct('uri', uri)),
+        output_schema => 'invoice_number STRING, total DOUBLE'
+    ) AS g
+    FROM invoices
+)
+WHERE g.status = ''
 ```
 
 ### Generative AI (Gemini) Model Inference

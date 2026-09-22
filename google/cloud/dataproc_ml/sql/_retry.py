@@ -30,19 +30,18 @@ logger = logging.getLogger(__name__)
 # failures and gateway timeouts.
 RETRYABLE_HTTP_CODES = frozenset({408, 429, 500, 503, 504})
 
-# Canonical error codes whose messages BigQuery passes through verbatim; these
-# describe a problem with the request itself, so the detail is actionable.
-_PASSTHROUGH_CODES = frozenset(
+# Canonical error codes whose remote message is worth quoting verbatim: each
+# describes a problem with the request itself, so the detail is actionable.
+_DETAILED_CODES = frozenset(
     {
         "FAILED_PRECONDITION",
         "PERMISSION_DENIED",
         "NOT_FOUND",
         "INVALID_ARGUMENT",
         "OUT_OF_RANGE",
+        "RESOURCE_EXHAUSTED",
     }
 )
-
-_QUOTA_MESSAGE_PREFIX = "Quota exceeded for metric "
 
 _HTTP_TO_CANONICAL_CODE = {
     400: "INVALID_ARGUMENT",
@@ -60,8 +59,7 @@ _HTTP_TO_CANONICAL_CODE = {
     504: "DEADLINE_EXCEEDED",
 }
 
-#: Reported when the request was throttled and outlived the retry budget.
-RATE_LIMITED_STATUS = "RATE_LIMITED"
+
 
 
 def _api_error_types():
@@ -132,29 +130,13 @@ def _canonical_code(exception: BaseException) -> str:
 
 
 def to_status(exception: BaseException) -> str:
-    """Converts a model error into the row's ``status`` value.
+    """Describes a model error in words, for the row's ``status`` field.
 
-    Rate limiting gets its own name because it is the one failure a caller is
-    expected to react to programmatically, by slowing the query down or
-    retrying it later. Everything else is described rather than classified,
-    since the detail is what makes it actionable.
-
-    Args:
-        exception: The exception raised while calling the model.
-
-    Returns:
-        ``RATE_LIMITED``, or a human readable description. Never empty.
-    """
-    if _canonical_code(exception) == "RESOURCE_EXHAUSTED":
-        return RATE_LIMITED_STATUS
-    return to_status_message(exception)
-
-
-def to_status_message(exception: BaseException) -> str:
-    """Describes a model error in words.
-
-    Request errors are surfaced verbatim, quota messages are passed through,
-    and everything else is summarized as a retryable error.
+    The canonical code leads the message so that a caller can classify a
+    failure by prefix — ``RESOURCE_EXHAUSTED`` for throttling, ``NOT_FOUND``
+    for a missing file — without this library having to maintain a closed
+    taxonomy of its own. Success is reported as an empty string, so the
+    dead-letter filter is ``WHERE status != ''``.
 
     Args:
         exception: The exception raised while calling the model.
@@ -165,16 +147,12 @@ def to_status_message(exception: BaseException) -> str:
     code = _canonical_code(exception)
     message = getattr(exception, "message", None) or str(exception)
 
-    if code in _PASSTHROUGH_CODES:
+    if code in _DETAILED_CODES:
         return f"{code}: {message}"
-    if code == "RESOURCE_EXHAUSTED" and message.startswith(
-        _QUOTA_MESSAGE_PREFIX
-    ):
-        return message
-    return (
-        f"A retryable error occurred: {code} error from remote "
-        "service/endpoint."
-    )
+    # Other backend failures are summarized rather than quoted: the remote
+    # message for these is usually an opaque internal identifier.
+    return f"{code}: a retryable error occurred calling the remote service."
+
 
 
 def full_jitter_delay(

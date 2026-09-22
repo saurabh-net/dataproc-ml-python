@@ -32,7 +32,7 @@ from pyspark.sql.types import (
 
 # pylint: disable=ungrouped-imports
 from google.cloud.dataproc_ml.sql import _ai_generate as ai_generate_module
-from google.cloud.dataproc_ml.sql import ai_generate, ai_generate_udf
+from google.cloud.dataproc_ml.sql import ai_generate, ai_generate_udf, file
 
 # pylint: enable=ungrouped-imports
 
@@ -126,6 +126,29 @@ def echoes_the_request():
     return _generate_content
 
 
+def echoes_the_parts():
+    """Returns a fake that reports the parts a multimodal prompt became."""
+
+    async def _generate_content(*, model, contents, config):
+        del model, config
+        if isinstance(contents, str):
+            return response_with_text(json.dumps([{"text": contents}]))
+        described = []
+        for part in contents:
+            if part.text is not None:
+                described.append({"text": part.text})
+            else:
+                described.append(
+                    {
+                        "uri": part.file_data.file_uri,
+                        "mime_type": part.file_data.mime_type,
+                    }
+                )
+        return response_with_text(json.dumps(described))
+
+    return _generate_content
+
+
 def run(coroutine):
     """Runs one coroutine to completion."""
     return asyncio.run(coroutine)
@@ -133,9 +156,9 @@ def run(coroutine):
 
 def generate_one(**kwargs):
     """Calls the per-row entry point with the arguments a batch would pass."""
-    kwargs.setdefault("endpoint", None)
-    kwargs.setdefault("model_params", None)
-    kwargs.setdefault("output_schema", None)
+    kwargs.setdefault("model", ai_generate_module.DEFAULT_ENDPOINT)
+    kwargs.setdefault("config", ai_generate_module._resolve_config(None, None))
+    # pylint: disable-next=missing-kwoa
     return run(ai_generate_module._generate_one(**kwargs))
 
 
@@ -165,7 +188,7 @@ class TestPromptColumn(SparkTestCase):
         column = ai_generate_module._to_prompt_column("text")
         self.assertEqual(df.select(column).first()[0], "hello")
 
-    def test_parts_are_concatenated_in_order(self):
+    def test_text_parts_are_concatenated_in_order(self):
         df = self.spark.createDataFrame([("world",)], ["text"])
         column = ai_generate_module._to_prompt_column(
             [sf.lit("hello "), sf.col("text"), sf.lit("!")]
@@ -196,6 +219,42 @@ class TestPromptColumn(SparkTestCase):
                 value = df.select(column).first()[0]
                 self.assertEqual(value, "7")
                 self.assertIsInstance(value, str)
+
+    def test_a_lone_file_becomes_a_uri_struct(self):
+        # The field names matter here: they are what tells the worker that the
+        # struct is one file rather than a list of parts.
+        df = self.spark.createDataFrame([("gs://b/x.pdf",)], ["uri"])
+        column = ai_generate_module._to_prompt_column(file(sf.col("uri")))
+
+        field = df.select(column.alias("p")).schema["p"]
+        self.assertEqual(
+            [f.name for f in field.dataType.fields], ["uri"]
+        )
+        self.assertEqual(df.select(column).first()[0]["uri"], "gs://b/x.pdf")
+
+    def test_a_file_carries_its_content_type(self):
+        df = self.spark.createDataFrame([("gs://b/x",)], ["uri"])
+        column = ai_generate_module._to_prompt_column(
+            file(sf.col("uri"), "application/pdf")
+        )
+
+        row = df.select(column).first()[0]
+        self.assertEqual(row["uri"], "gs://b/x")
+        self.assertEqual(row["content_type"], "application/pdf")
+
+    def test_a_mixed_prompt_becomes_a_struct_of_parts(self):
+        df = self.spark.createDataFrame([("gs://b/x.pdf",)], ["uri"])
+        column = ai_generate_module._to_prompt_column(
+            [sf.lit("Read this: "), file(sf.col("uri"))]
+        )
+
+        field = df.select(column.alias("p")).schema["p"]
+        # Positional names, so that a part can never be mistaken for a file
+        # and so that the worker is never tempted to read them.
+        self.assertEqual([f.name for f in field.dataType.fields], ["_1", "_2"])
+        row = df.select(column).first()[0]
+        self.assertEqual(row["_1"], "Read this: ")
+        self.assertEqual(row["_2"]["uri"], "gs://b/x.pdf")
 
 
 class TestReturnType(SparkTestCase):
@@ -300,6 +359,56 @@ class TestArgumentRendering(unittest.TestCase):
         )
 
 
+class TestConstantArguments(unittest.TestCase):
+    """The settings configure the call, so they may not vary by row."""
+
+    def _series(self, *values):
+        import pandas as pd  # pylint: disable=import-outside-toplevel
+
+        return pd.Series(list(values), dtype="object")
+
+    def test_an_absent_argument_has_no_value(self):
+        self.assertIsNone(ai_generate_module._constant(None, "endpoint"))
+
+    def test_an_empty_batch_has_no_value(self):
+        self.assertIsNone(
+            ai_generate_module._constant(self._series(), "endpoint")
+        )
+
+    def test_a_repeated_value_is_the_value(self):
+        self.assertEqual(
+            ai_generate_module._constant(
+                self._series("gemini-3.6-flash", "gemini-3.6-flash"),
+                "endpoint",
+            ),
+            "gemini-3.6-flash",
+        )
+
+    def test_nulls_and_blanks_mean_the_default(self):
+        for values in [(None, None), ("", ""), ("  ", "  ")]:
+            with self.subTest(values=values):
+                self.assertIsNone(
+                    ai_generate_module._constant(
+                        self._series(*values), "endpoint"
+                    )
+                )
+
+    def test_a_varying_value_is_rejected(self):
+        for name in ai_generate_module._CONSTANT_ARGUMENTS:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError) as caught:
+                    ai_generate_module._constant(
+                        self._series("a", "b"), name
+                    )
+                self.assertIn(name, str(caught.exception))
+
+    def test_a_null_counts_as_a_distinct_value(self):
+        # Otherwise half a column of nulls would silently take the other
+        # half's setting.
+        with self.assertRaises(ValueError):
+            ai_generate_module._constant(self._series("a", None), "endpoint")
+
+
 class TestConfigResolution(unittest.TestCase):
     """Turning the string arguments into a generation config."""
 
@@ -382,7 +491,7 @@ class TestGenerateOneRow(unittest.TestCase):
             prompt="hi",
         )
         self.assertEqual(row["result"], "hello")
-        self.assertEqual(row["status"], "SUCCESS")
+        self.assertEqual(row["status"], "")
         self.assertIn("candidates", row["full_response"])
 
     def test_full_response_is_a_json_string(self):
@@ -401,8 +510,8 @@ class TestGenerateOneRow(unittest.TestCase):
             with self.subTest(prompt=prompt):
                 row = generate_one(generate_content=_fail, prompt=prompt)
                 self.assertIsNone(row["result"])
-                self.assertIsNone(row["full_response"])
-                self.assertEqual(row["status"], "SUCCESS")
+                self.assertEqual(row["full_response"], "{}")
+                self.assertEqual(row["status"], "")
 
     def test_reasoning_parts_are_skipped(self):
         row = generate_one(
@@ -424,9 +533,10 @@ class TestGenerateOneRow(unittest.TestCase):
                     prompt="hi",
                 )
                 self.assertIsNone(row["result"])
-                self.assertEqual(row["status"], "SAFETY_BLOCKED")
+                self.assertTrue(row["status"].startswith("SAFETY_BLOCKED:"))
+                self.assertIn(reason.name, row["status"])
                 # The reason is still recoverable from the full response.
-                self.assertIsNotNone(row["full_response"])
+                self.assertIn("candidates", row["full_response"])
 
     def test_an_ordinary_finish_reason_is_not_a_block(self):
         row = generate_one(
@@ -444,21 +554,11 @@ class TestGenerateOneRow(unittest.TestCase):
             ),
             prompt="hi",
         )
-        self.assertEqual(row["status"], "SUCCESS")
+        self.assertEqual(row["status"], "")
         self.assertEqual(row["result"], "hi")
 
-    def test_rate_limiting_is_reported(self):
-        with mock.patch.object(ai_generate_module, "_MAX_ATTEMPTS", 1):
-            row = generate_one(
-                generate_content=replies_with(
-                    api_error(429, "RESOURCE_EXHAUSTED", "slow down")
-                ),
-                prompt="hi",
-            )
-        self.assertIsNone(row["result"])
-        self.assertEqual(row["status"], "RATE_LIMITED")
-
-    def test_a_request_error_is_described(self):
+    def test_a_failure_leaves_an_empty_json_document(self):
+        # Never null, so that parse_json(full_response) is safe on every row.
         with mock.patch.object(ai_generate_module, "_MAX_ATTEMPTS", 1):
             row = generate_one(
                 generate_content=replies_with(
@@ -466,8 +566,28 @@ class TestGenerateOneRow(unittest.TestCase):
                 ),
                 prompt="hi",
             )
-        self.assertIsNone(row["result"])
-        self.assertIn("NOT_FOUND", row["status"])
+        self.assertEqual(row["full_response"], "{}")
+        self.assertEqual(json.loads(row["full_response"]), {})
+
+    def test_the_status_leads_with_the_canonical_code(self):
+        for code, status in [
+            (429, "RESOURCE_EXHAUSTED"),
+            (404, "NOT_FOUND"),
+            (403, "PERMISSION_DENIED"),
+        ]:
+            with self.subTest(status=status):
+                with mock.patch.object(
+                    ai_generate_module, "_MAX_ATTEMPTS", 1
+                ):
+                    row = generate_one(
+                        generate_content=replies_with(
+                            api_error(code, status, "the detail")
+                        ),
+                        prompt="hi",
+                    )
+                self.assertIsNone(row["result"])
+                self.assertTrue(row["status"].startswith(f"{status}:"))
+                self.assertIn("the detail", row["status"])
 
     def test_a_transient_failure_is_retried(self):
         with mock.patch.object(
@@ -481,7 +601,7 @@ class TestGenerateOneRow(unittest.TestCase):
                 prompt="hi",
             )
         self.assertEqual(row["result"], "recovered")
-        self.assertEqual(row["status"], "SUCCESS")
+        self.assertEqual(row["status"], "")
 
     def test_a_bug_in_this_library_is_not_hidden_in_status(self):
         async def _raise(**_):
@@ -490,52 +610,43 @@ class TestGenerateOneRow(unittest.TestCase):
         with self.assertRaises(TypeError):
             generate_one(generate_content=_raise, prompt="hi")
 
-    def test_an_invalid_argument_is_reported_per_row(self):
-        # Called from SQL the arguments are columns, so they cannot be
-        # rejected on the driver.
-        row = generate_one(
-            generate_content=replies_with(response_with_text("unused")),
-            prompt="hi",
-            output_schema="a NOTATYPE",
-        )
-        self.assertIsNone(row["result"])
-        self.assertIn("output_schema", row["status"])
-
-    def test_the_endpoint_argument_selects_the_model(self):
-        row = generate_one(
-            generate_content=echoes_the_request(),
-            prompt="hi",
-            endpoint="gemini-2.5-pro",
-        )
-        self.assertEqual(json.loads(row["result"])["model"], "gemini-2.5-pro")
-
-    def test_a_missing_endpoint_falls_back_to_the_default(self):
-        for endpoint in [None, "", "   "]:
-            with self.subTest(endpoint=endpoint):
-                row = generate_one(
-                    generate_content=echoes_the_request(),
-                    prompt="hi",
-                    endpoint=endpoint,
-                )
-                self.assertEqual(
-                    json.loads(row["result"])["model"],
-                    ai_generate_module.DEFAULT_ENDPOINT,
-                )
-
-    def test_a_fully_qualified_endpoint_is_passed_through(self):
-        path = "projects/p/locations/l/publishers/google/models/m"
-        row = generate_one(
-            generate_content=echoes_the_request(), prompt="hi", endpoint=path
-        )
-        self.assertEqual(json.loads(row["result"])["model"], path)
-
     def test_a_non_string_prompt_is_rendered(self):
         # Arrow delivers a nullable BIGINT column as floats, so a whole number
         # must not pick up a fraction just because another row was null.
-        row = generate_one(
-            generate_content=answers_the_prompt(), prompt=2.0
-        )
+        row = generate_one(generate_content=answers_the_prompt(), prompt=2.0)
         self.assertEqual(row["result"], "answer to 2")
+
+    def test_a_malformed_part_is_reported_per_row(self):
+        # Unlike a malformed setting, a bad URI is a property of one row.
+        row = generate_one(
+            generate_content=answers_the_prompt(),
+            prompt=[{"uri": "gs://bucket/file-without-an-extension"}],
+        )
+        self.assertIsNone(row["result"])
+        self.assertTrue(row["status"].startswith("INVALID_ARGUMENT:"))
+
+    def test_a_prompt_of_only_null_parts_is_a_null_prompt(self):
+        def _fail(**_):
+            raise AssertionError("the model must not be called")
+
+        row = generate_one(
+            generate_content=_fail, prompt=[None, {"uri": None}]
+        )
+        self.assertIsNone(row["result"])
+        self.assertEqual(row["status"], "")
+
+    def test_parts_are_sent_in_order(self):
+        row = generate_one(
+            generate_content=echoes_the_parts(),
+            prompt=["Read this: ", {"uri": "gs://b/x.pdf"}],
+        )
+        self.assertEqual(
+            json.loads(row["result"]),
+            [
+                {"text": "Read this: "},
+                {"uri": "gs://b/x.pdf", "mime_type": "application/pdf"},
+            ],
+        )
 
 
 class TestDriverValidation(SparkTestCase):
@@ -599,7 +710,7 @@ class TestSparkExecution(SparkTestCase):
             ],
         )
         for row in rows:
-            self.assertEqual(row["status"], "SUCCESS")
+            self.assertEqual(row["status"], "")
 
     def test_a_failing_row_does_not_fail_the_query(self):
         with mock.patch.object(ai_generate_module, "_MAX_ATTEMPTS", 1):
@@ -614,13 +725,34 @@ class TestSparkExecution(SparkTestCase):
                         ),
                     ),
                 )
-                .select("g.result", "g.status")
+                .select("g.result", "g.status", "g.full_response")
                 .collect()
             )
 
         self.assertEqual(len(rows), 4)
         for row in rows:
             self.assertIsNone(row["result"])
+            self.assertEqual(row["full_response"], "{}")
+
+    def test_the_dead_letter_filter_selects_the_failed_rows(self):
+        # The point of the empty status: one predicate finds what went wrong.
+        with mock.patch.object(ai_generate_module, "_MAX_ATTEMPTS", 1):
+            failed = (
+                self._documents()
+                .withColumn(
+                    "g",
+                    ai_generate(
+                        "body",
+                        _generate_content=replies_with(
+                            api_error(404, "NOT_FOUND", "no such model")
+                        ),
+                    ),
+                )
+                .where("g.status <> ''")
+                .count()
+            )
+        # The null-prompt row never calls the model, so it succeeds.
+        self.assertEqual(failed, 3)
 
     def test_full_response_can_be_parsed_back_into_json(self):
         # The spec fixes the field as a string; parse_json recovers a VARIANT
@@ -675,30 +807,28 @@ class TestSparkExecution(SparkTestCase):
         ).first()
 
         request = json.loads(row["r"])
-        self.assertEqual(
-            request["model"], ai_generate_module.DEFAULT_ENDPOINT
-        )
+        self.assertEqual(request["model"], ai_generate_module.DEFAULT_ENDPOINT)
         self.assertIsNotNone(request["response_schema"])
 
-    def test_a_bad_argument_from_sql_is_reported_per_row(self):
+    def test_a_bad_setting_from_sql_fails_the_query(self):
+        # A mistake in the query is not a property of a row: it must not cost
+        # a full scan producing a column of failures.
         self.spark.udf.register(
             "ai_generate",
             ai_generate_udf(_generate_content=answers_the_prompt()),
         )
         self._documents().createOrReplaceTempView("documents")
 
-        rows = self.spark.sql(
-            "SELECT ai_generate(prompt => body,"
-            " output_schema => 'a NOTATYPE').status AS s FROM documents"
-        ).collect()
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate(prompt => body,"
+                " output_schema => 'a NOTATYPE').status AS s FROM documents"
+            ).collect()
+        self.assertIn("NOTATYPE", str(caught.exception))
 
-        self.assertEqual(len(rows), 4)
-        # The null-prompt row never reaches the configuration.
-        for row in rows[:3]:
-            self.assertIn("output_schema", row["s"])
-
-    def test_the_argument_may_vary_per_row(self):
-        # A column, not a literal: each row must get its own configuration.
+    def test_a_setting_that_varies_per_row_fails_the_query(self):
+        # endpoint configures the call, not the row. BigQuery rejects a column
+        # outright; Spark SQL cannot, so the value is checked as it arrives.
         self.spark.udf.register(
             "ai_generate",
             ai_generate_udf(_generate_content=echoes_the_request()),
@@ -706,16 +836,35 @@ class TestSparkExecution(SparkTestCase):
         self.spark.createDataFrame(
             [("a", "gemini-2.5-pro"), ("b", "gemini-3.6-flash")],
             "body STRING, model STRING",
-        ).createOrReplaceTempView("varying")
+        ).repartition(1).createOrReplaceTempView("varying")
+
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate(prompt => body, endpoint => model).result"
+                " AS r FROM varying"
+            ).collect()
+        self.assertIn("endpoint", str(caught.exception))
+
+    def test_a_repeated_column_value_is_accepted(self):
+        # A literal and a column that happens to repeat are indistinguishable
+        # on the executor, so the constant one has to keep working.
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self.spark.createDataFrame(
+            [("a", "gemini-2.5-pro"), ("b", "gemini-2.5-pro")],
+            "body STRING, model STRING",
+        ).createOrReplaceTempView("constant")
 
         rows = self.spark.sql(
-            "SELECT body, ai_generate(prompt => body, endpoint => model).result"
-            " AS r FROM varying ORDER BY body"
+            "SELECT ai_generate(prompt => body, endpoint => model).result AS r"
+            " FROM constant"
         ).collect()
 
         self.assertEqual(
             [json.loads(r["r"])["model"] for r in rows],
-            ["gemini-2.5-pro", "gemini-3.6-flash"],
+            ["gemini-2.5-pro", "gemini-2.5-pro"],
         )
 
     def test_a_non_string_column_works_in_spark_sql(self):
@@ -734,6 +883,172 @@ class TestSparkExecution(SparkTestCase):
             [r["r"] for r in rows],
             ["answer to 1", "answer to 2", "answer to 3", "answer to 4"],
         )
+
+
+class TestMultimodalPrompts(SparkTestCase):
+    """Struct prompts, through a real Spark plan in both dialects."""
+
+    def _files(self):
+        return self.spark.createDataFrame(
+            [
+                ("gs://bucket/invoice.pdf", "application/pdf"),
+                ("gs://bucket/photo.png", None),
+            ],
+            "uri STRING, content_type STRING",
+        )
+
+    def test_a_file_only_prompt(self):
+        rows = (
+            self._files()
+            .withColumn(
+                "g",
+                ai_generate(
+                    file(sf.col("uri")),
+                    _generate_content=echoes_the_parts(),
+                ),
+            )
+            .select("uri", "g.result")
+            .orderBy("uri")
+            .collect()
+        )
+
+        self.assertEqual(
+            [json.loads(row["result"]) for row in rows],
+            [
+                [
+                    {
+                        "uri": "gs://bucket/invoice.pdf",
+                        "mime_type": "application/pdf",
+                    }
+                ],
+                [{"uri": "gs://bucket/photo.png", "mime_type": "image/png"}],
+            ],
+        )
+
+    def test_text_and_a_file_keep_their_order(self):
+        rows = (
+            self._files()
+            .limit(1)
+            .withColumn(
+                "g",
+                ai_generate(
+                    [
+                        sf.lit("Total? "),
+                        file(sf.col("uri")),
+                        sf.lit(" Answer in digits."),
+                    ],
+                    _generate_content=echoes_the_parts(),
+                ),
+            )
+            .select("g.result")
+            .collect()
+        )
+
+        self.assertEqual(
+            json.loads(rows[0]["result"]),
+            [
+                {"text": "Total? "},
+                {
+                    "uri": "gs://bucket/invoice.pdf",
+                    "mime_type": "application/pdf",
+                },
+                {"text": " Answer in digits."},
+            ],
+        )
+
+    def test_the_content_type_column_overrides_detection(self):
+        rows = (
+            self._files()
+            .limit(1)
+            .withColumn(
+                "g",
+                ai_generate(
+                    file(sf.col("uri"), sf.lit("text/plain")),
+                    _generate_content=echoes_the_parts(),
+                ),
+            )
+            .select("g.result")
+            .collect()
+        )
+
+        self.assertEqual(
+            json.loads(rows[0]["result"])[0]["mime_type"], "text/plain"
+        )
+
+    def test_a_named_struct_is_a_file_in_spark_sql(self):
+        self.spark.udf.register(
+            "ai_generate", ai_generate_udf(_generate_content=echoes_the_parts())
+        )
+        self._files().createOrReplaceTempView("files")
+
+        rows = self.spark.sql(
+            "SELECT ai_generate(named_struct('uri', uri)).result AS r"
+            " FROM files ORDER BY uri"
+        ).collect()
+
+        self.assertEqual(
+            [json.loads(row["r"])[0]["uri"] for row in rows],
+            ["gs://bucket/invoice.pdf", "gs://bucket/photo.png"],
+        )
+
+    def test_a_struct_of_parts_in_spark_sql(self):
+        self.spark.udf.register(
+            "ai_generate", ai_generate_udf(_generate_content=echoes_the_parts())
+        )
+        self._files().createOrReplaceTempView("files")
+
+        rows = self.spark.sql(
+            "SELECT ai_generate("
+            "  prompt => struct('Summarize: ', named_struct('uri', uri))"
+            ").result AS r FROM files ORDER BY uri"
+        ).collect()
+
+        self.assertEqual(
+            json.loads(rows[0]["r"]),
+            [
+                {"text": "Summarize: "},
+                {
+                    "uri": "gs://bucket/invoice.pdf",
+                    "mime_type": "application/pdf",
+                },
+            ],
+        )
+
+    def test_an_unreadable_extension_is_reported_per_row(self):
+        self.spark.udf.register(
+            "ai_generate", ai_generate_udf(_generate_content=echoes_the_parts())
+        )
+        self.spark.createDataFrame(
+            [("gs://bucket/invoice.pdf",), ("gs://bucket/mystery",)],
+            "uri STRING",
+        ).createOrReplaceTempView("mixed")
+
+        rows = self.spark.sql(
+            "SELECT uri, ai_generate(named_struct('uri', uri)) AS g"
+            " FROM mixed ORDER BY uri"
+        ).collect()
+
+        # The good row still succeeds: only the row with the unusable name
+        # reports a problem.
+        self.assertEqual(rows[0]["g"]["status"], "")
+        self.assertTrue(
+            rows[1]["g"]["status"].startswith("INVALID_ARGUMENT:")
+        )
+
+    def test_an_unknown_field_is_rejected(self):
+        self.spark.udf.register(
+            "ai_generate", ai_generate_udf(_generate_content=echoes_the_parts())
+        )
+        self._files().createOrReplaceTempView("files")
+
+        rows = self.spark.sql(
+            "SELECT ai_generate(struct("
+            "  named_struct('uri', uri, 'size', 1)"
+            ")).status AS s FROM files"
+        ).collect()
+
+        for row in rows:
+            self.assertIn("uri", row["s"])
 
 
 if __name__ == "__main__":

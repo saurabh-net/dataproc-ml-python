@@ -18,6 +18,10 @@ They rely on Application Default Credentials and, unless GOOGLE_CLOUD_PROJECT
 is set, on the project discovered from the environment. The location is not
 taken from the environment: these tests exercise the default global endpoint.
 Running them incurs Vertex AI charges.
+
+The multimodal tests read fixtures from a public-to-the-project bucket; the
+files are read by Vertex AI, not by Spark, so the caller's credentials are what
+must be able to see them.
 """
 
 import json
@@ -26,7 +30,8 @@ import unittest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as sf
 
-from google.cloud.dataproc_ml.sql import ai_generate, ai_generate_udf
+from google.cloud.dataproc_ml.sql import _client
+from google.cloud.dataproc_ml.sql import ai_generate, ai_generate_udf, file
 
 _AIRPORT_PROMPT = (
     "What is the airport code of the largest airport in {city}? "
@@ -43,6 +48,15 @@ _DETERMINISTIC = json.dumps(
         }
     }
 )
+
+_FIXTURES = "gs://dataproc_ai_functions_test"
+#: A product photo of a pet bed with the brand printed on a label.
+_DOG_BED = f"{_FIXTURES}/images/playful-pup-dog-bed.png"
+#: A close-up photograph of a white daisy. A JPEG, so that MIME detection is
+#: exercised on more than one extension.
+_FLOWER = f"{_FIXTURES}/images/100080576_f52e8ee070_n.jpg"
+#: A one page invoice addressed to John Doe, number 001.
+_INVOICE = f"{_FIXTURES}/pdfs/invoice.pdf"
 
 
 class TestAiGenerate(unittest.TestCase):
@@ -64,10 +78,6 @@ class TestAiGenerate(unittest.TestCase):
             # Several rows per batch, spread over more than one task.
         ).repartition(3)
 
-    @classmethod
-    def tearDownClass(cls):
-        cls.spark.stop()
-
     def _prompt(self):
         before, after = _AIRPORT_PROMPT.split("{city}", maxsplit=1)
         return [sf.lit(before), sf.col("city"), sf.lit(after)]
@@ -82,7 +92,7 @@ class TestAiGenerate(unittest.TestCase):
         self.assertEqual(len(rows), 7)
         for row in rows:
             with self.subTest(city=row["city"]):
-                self.assertEqual(row["status"], "SUCCESS")
+                self.assertEqual(row["status"], "")
                 self.assertIsNotNone(row["result"])
                 self.assertIn(row["expected"], row["result"].upper())
 
@@ -100,6 +110,14 @@ class TestAiGenerate(unittest.TestCase):
         self.assertEqual(
             plain.schema["g"].dataType, structured.schema["g"].dataType
         )
+
+    def test_the_dead_letter_filter_finds_nothing_when_all_rows_succeed(self):
+        # The contract that makes the empty status worth having: one predicate
+        # separates the rows that need attention from the rest.
+        result = self.cities.withColumn("g", ai_generate(self._prompt()))
+
+        self.assertEqual(result.where("g.status <> ''").count(), 0)
+        self.assertEqual(result.where("g.status = ''").count(), 7)
 
     def test_full_response_carries_usage_metadata(self):
         result = self.cities.limit(1).withColumn(
@@ -135,7 +153,7 @@ class TestAiGenerate(unittest.TestCase):
         )
 
         for row in rows:
-            self.assertEqual(row["status"], "SUCCESS")
+            self.assertEqual(row["status"], "")
             self.assertIsNotNone(row["result"])
 
     def test_model_params_can_cap_the_output(self):
@@ -161,7 +179,7 @@ class TestAiGenerate(unittest.TestCase):
         )
 
         for row in rows:
-            self.assertEqual(row["status"], "SUCCESS")
+            self.assertEqual(row["status"], "")
             self.assertLess(len(row["result"].split()), 60)
 
     def test_structured_output_is_json_in_the_result_field(self):
@@ -194,7 +212,7 @@ class TestAiGenerate(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         for row in rows:
             with self.subTest(result=row["result"]):
-                self.assertEqual(row["status"], "SUCCESS")
+                self.assertEqual(row["status"], "")
                 # Constrained decoding guarantees this parses and conforms.
                 parsed = json.loads(row["result"])
                 self.assertIsInstance(parsed["sentiment"], str)
@@ -227,8 +245,6 @@ class TestAiGenerate(unittest.TestCase):
         self.assertIsInstance(rows[0]["score"], int)
 
     def test_a_fully_qualified_endpoint_is_accepted(self):
-        from google.cloud.dataproc_ml.sql import _client
-
         project, _ = _client.resolve_project_and_location(None, None)
         self.assertIsNotNone(project, "the test project must be discoverable")
 
@@ -243,28 +259,20 @@ class TestAiGenerate(unittest.TestCase):
             .collect()
         )
 
-        self.assertEqual(rows[0]["status"], "SUCCESS")
+        self.assertEqual(rows[0]["status"], "")
         self.assertIsNotNone(rows[0]["result"])
 
-    def test_unknown_model_is_reported_per_row(self):
-        # A bad endpoint must not fail the query: every row reports the error
-        # in its status.
-        rows = (
-            self.cities.limit(2)
-            .withColumn(
+    def test_an_unknown_model_fails_the_query(self):
+        # A typo in the model name is a mistake in the query, not a property
+        # of a row: it must not cost a full scan producing a column of
+        # failures. BigQuery likewise rejects it before returning any row.
+        with self.assertRaises(Exception) as caught:
+            self.cities.withColumn(
                 "g",
-                ai_generate(
-                    self._prompt(), endpoint="gemini-does-not-exist"
-                ),
-            )
-            .select("g.result", "g.status")
-            .collect()
-        )
+                ai_generate(self._prompt(), endpoint="gemini-does-not-exist"),
+            ).collect()
 
-        self.assertEqual(len(rows), 2)
-        for row in rows:
-            self.assertIsNone(row["result"])
-            self.assertIn("NOT_FOUND", row["status"])
+        self.assertIn("gemini-does-not-exist", str(caught.exception))
 
     def test_registered_for_spark_sql(self):
         self.spark.udf.register("ai_generate", ai_generate_udf())
@@ -299,30 +307,250 @@ class TestAiGenerate(unittest.TestCase):
         self.assertEqual(len(rows), 7)
         for row in rows:
             with self.subTest(city=row["city"]):
-                self.assertEqual(row["g"]["status"], "SUCCESS")
+                self.assertEqual(row["g"]["status"], "")
                 parsed = json.loads(row["g"]["result"])
                 self.assertIn(row["expected"], parsed["code"].upper())
 
-    def test_spark_sql_argument_may_vary_per_row(self):
+    def test_a_setting_that_varies_per_row_fails_the_query(self):
+        # endpoint, model_params and output_schema configure the call, not the
+        # row. BigQuery rejects a column for them at plan time; Spark SQL
+        # cannot tell a literal from a column, so the value is checked as it
+        # arrives and a second distinct one fails the query.
         self.spark.udf.register("ai_generate", ai_generate_udf())
         self.spark.createDataFrame(
             [
-                ("France", "Answer with the capital city only."),
-                ("Japan", "Answer with the capital city only."),
+                ("France", "capital STRING"),
+                ("Japan", "city STRING"),
             ],
-            ["country", "instruction"],
-        ).createOrReplaceTempView("questions")
+            ["country", "schema"],
+        ).repartition(1).createOrReplaceTempView("questions")
 
-        rows = self.spark.sql(
-            "SELECT country, ai_generate("
-            "  prompt => CONCAT(instruction, ' Country: ', country),"
-            "  output_schema => 'capital STRING'"
-            ").result AS r FROM questions ORDER BY country"
-        ).collect()
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate("
+                "  prompt => CONCAT('Capital of ', country, '?'),"
+                "  output_schema => schema"
+                ").result AS r FROM questions"
+            ).collect()
 
-        capitals = [json.loads(row["r"])["capital"] for row in rows]
-        self.assertIn("Paris", capitals[0])
-        self.assertIn("Tokyo", capitals[1])
+        self.assertIn("output_schema", str(caught.exception))
+
+
+class TestMultimodalPrompts(unittest.TestCase):
+    """Prompts that include a file, against the real model."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.spark = SparkSession.builder.getOrCreate()
+        cls.images = cls.spark.createDataFrame(
+            [(_DOG_BED,), (_FLOWER,)], ["uri"]
+        )
+
+    def test_text_and_an_image(self):
+        # The brand is printed on a label in the photo, so a correct answer
+        # can only come from having actually read the image.
+        rows = (
+            self.spark.createDataFrame([(_DOG_BED,)], ["uri"])
+            .withColumn(
+                "g",
+                ai_generate(
+                    [
+                        sf.lit(
+                            "What brand name is printed on the label of this "
+                            "product? Answer with the brand name only."
+                        ),
+                        file(sf.col("uri")),
+                    ],
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("g.result", "g.status")
+            .collect()
+        )
+
+        self.assertEqual(rows[0]["status"], "")
+        self.assertIn("playful pup", rows[0]["result"].lower())
+
+    def test_a_file_on_its_own_is_a_prompt(self):
+        # named_struct('uri', ...) with nothing else is one file, not a part
+        # list holding one string.
+        rows = (
+            self.spark.createDataFrame([(_FLOWER,)], ["uri"])
+            .withColumn(
+                "g",
+                ai_generate(
+                    file(sf.col("uri")),
+                    output_schema="subject STRING",
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("g.result", "g.status")
+            .collect()
+        )
+
+        self.assertEqual(rows[0]["status"], "")
+        subject = json.loads(rows[0]["result"])["subject"].lower()
+        self.assertTrue(
+            any(word in subject for word in ("flower", "daisy", "petal")),
+            subject,
+        )
+
+    def test_the_media_type_is_inferred_from_the_extension(self):
+        # One PNG and one JPEG in the same column, with no content_type given.
+        rows = (
+            self.images.withColumn(
+                "g",
+                ai_generate(
+                    [
+                        sf.lit(
+                            "Is the main subject of this image a plant or a "
+                            "manufactured object? Answer 'plant' or 'object'."
+                        ),
+                        file(sf.col("uri")),
+                    ],
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("uri", "g.result", "g.status")
+            .orderBy("uri")
+            .collect()
+        )
+
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row["status"], "")
+        # Ordered by URI: the numeric flower filename sorts before "playful".
+        self.assertIn("plant", rows[0]["result"].lower())
+        self.assertIn("object", rows[1]["result"].lower())
+
+    def test_an_explicit_content_type_is_used(self):
+        rows = (
+            self.spark.createDataFrame([(_INVOICE, "application/pdf")],
+                                       ["uri", "kind"])
+            .withColumn(
+                "g",
+                ai_generate(
+                    [
+                        sf.lit("Who is this invoice addressed to?"),
+                        file(sf.col("uri"), sf.col("kind")),
+                    ],
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("g.result", "g.status")
+            .collect()
+        )
+
+        self.assertEqual(rows[0]["status"], "")
+        self.assertIn("john doe", rows[0]["result"].lower())
+
+    def test_a_pdf_with_structured_output(self):
+        rows = (
+            self.spark.createDataFrame([(_INVOICE,)], ["uri"])
+            .withColumn(
+                "g",
+                ai_generate(
+                    [
+                        sf.lit("Extract the invoice details."),
+                        file(sf.col("uri")),
+                    ],
+                    output_schema="invoice_number STRING, recipient STRING",
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("g.result", "g.status")
+            .collect()
+        )
+
+        self.assertEqual(rows[0]["status"], "")
+        parsed = json.loads(rows[0]["result"])
+        self.assertIn("001", parsed["invoice_number"])
+        self.assertIn("john doe", parsed["recipient"].lower())
+
+    def test_a_named_struct_is_a_file_in_spark_sql(self):
+        self.spark.udf.register("ai_generate", ai_generate_udf())
+        self.spark.createDataFrame(
+            [(_DOG_BED,)], ["uri"]
+        ).createOrReplaceTempView("documents")
+
+        row = self.spark.sql(
+            "SELECT ai_generate("
+            "  prompt => struct("
+            "    'What brand name is on the label? Brand name only.',"
+            "    named_struct('uri', uri)"
+            "  ),"
+            f"  model_params => '{_DETERMINISTIC}'"
+            ") AS g FROM documents"
+        ).first()
+
+        self.assertEqual(row["g"]["status"], "")
+        self.assertIn("playful pup", row["g"]["result"].lower())
+
+    def test_a_content_type_field_in_spark_sql(self):
+        self.spark.udf.register("ai_generate", ai_generate_udf())
+        self.spark.createDataFrame(
+            [(_INVOICE,)], ["uri"]
+        ).createOrReplaceTempView("documents")
+
+        row = self.spark.sql(
+            "SELECT ai_generate("
+            "  prompt => struct("
+            "    'What is the invoice number? Digits only.',"
+            "    named_struct('uri', uri, 'content_type', 'application/pdf')"
+            "  ),"
+            f"  model_params => '{_DETERMINISTIC}'"
+            ") AS g FROM documents"
+        ).first()
+
+        self.assertEqual(row["g"]["status"], "")
+        self.assertIn("001", row["g"]["result"])
+
+    def test_a_bad_uri_is_reported_per_row(self):
+        # Unlike a bad setting, a bad file is a property of one row: the good
+        # rows still produce answers.
+        rows = (
+            self.spark.createDataFrame(
+                [(_FLOWER,), (f"{_FIXTURES}/images/no-such-image.png",)],
+                ["uri"],
+            )
+            .withColumn(
+                "g",
+                ai_generate(
+                    [sf.lit("Name the subject in one word."),
+                     file(sf.col("uri"))],
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("uri", "g.result", "g.status", "g.full_response")
+            .orderBy("uri")
+            .collect()
+        )
+
+        self.assertEqual(rows[0]["status"], "")
+        self.assertIsNotNone(rows[0]["result"])
+        self.assertNotEqual(rows[1]["status"], "")
+        self.assertIsNone(rows[1]["result"])
+        # Never null, so the column can always be given to parse_json.
+        self.assertEqual(rows[1]["full_response"], "{}")
+
+    def test_a_uri_with_no_usable_extension_is_reported_per_row(self):
+        rows = (
+            self.spark.createDataFrame(
+                [(f"{_FIXTURES}/images/mystery",)], ["uri"]
+            )
+            .withColumn(
+                "g",
+                ai_generate(
+                    [sf.lit("Describe this."), file(sf.col("uri"))],
+                    model_params=_DETERMINISTIC,
+                ),
+            )
+            .select("g.status")
+            .collect()
+        )
+
+        self.assertTrue(rows[0]["status"].startswith("INVALID_ARGUMENT:"))
+        self.assertIn("content_type", rows[0]["status"])
 
 
 if __name__ == "__main__":

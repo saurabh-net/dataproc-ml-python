@@ -60,96 +60,79 @@ class TestErrorClassification(unittest.TestCase):
 
 
 class TestStatus(unittest.TestCase):
-    """``status`` names rate limiting and describes everything else."""
+    """``status`` leads with the canonical code and describes the failure.
 
-    def test_rate_limiting_gets_its_own_name(self):
-        for error in [
-            _api_error(429, "RESOURCE_EXHAUSTED", "too many requests"),
-            _api_error(429, "", "too many requests"),
+    Success is the empty string, so any non-empty status is a failure and the
+    dead-letter query never has to know a vocabulary. The code is a prefix
+    rather than the whole value so that a caller can still classify a failure
+    without this library maintaining a closed taxonomy of its own.
+    """
+
+    def test_the_canonical_code_leads(self):
+        for code, status in [
+            (400, "INVALID_ARGUMENT"),
+            (403, "PERMISSION_DENIED"),
+            (404, "NOT_FOUND"),
+            (429, "RESOURCE_EXHAUSTED"),
+            (503, "UNAVAILABLE"),
         ]:
-            with self.subTest(error=error):
-                self.assertEqual(_retry.to_status(error), "RATE_LIMITED")
+            with self.subTest(status=status):
+                error = _api_error(code, status, "the detail")
+                self.assertTrue(
+                    _retry.to_status(error).startswith(f"{status}: ")
+                )
 
-    def test_quota_exhaustion_is_rate_limiting(self):
-        message = (
-            "Quota exceeded for metric aiplatform.googleapis.com/"
-            "generate_content_requests_per_minute_per_project"
+    def test_the_code_is_derived_from_the_http_status_when_absent(self):
+        # The backend does not always fill in the canonical status.
+        self.assertTrue(
+            _retry.to_status(_api_error(429, "", "too many")).startswith(
+                "RESOURCE_EXHAUSTED: "
+            )
         )
-        error = _api_error(429, "RESOURCE_EXHAUSTED", message)
-        self.assertEqual(_retry.to_status(error), "RATE_LIMITED")
 
-    def test_other_failures_are_described_rather_than_classified(self):
-        error = _api_error(404, "NOT_FOUND", "Publisher Model was not found")
+    def test_actionable_failures_are_surfaced_verbatim(self):
+        for code, status, message in [
+            (
+                400,
+                "INVALID_ARGUMENT",
+                "HTTP links are not supported for requests restricted by "
+                "VPCSC.",
+            ),
+            (404, "NOT_FOUND", "Publisher Model was not found"),
+            (
+                429,
+                "RESOURCE_EXHAUSTED",
+                "Quota exceeded for metric aiplatform.googleapis.com/"
+                "generate_content_requests_per_minute_per_project",
+            ),
+        ]:
+            with self.subTest(status=status):
+                error = _api_error(code, status, message)
+                self.assertEqual(
+                    _retry.to_status(error), f"{status}: {message}"
+                )
+
+    def test_opaque_failures_are_summarised(self):
+        # The remote message for these is usually an internal identifier.
+        error = _api_error(503, "UNAVAILABLE", "0x8badf00d")
         self.assertEqual(
             _retry.to_status(error),
-            "NOT_FOUND: Publisher Model was not found",
+            "UNAVAILABLE: a retryable error occurred calling the remote "
+            "service.",
+        )
+        self.assertNotIn("0x8badf00d", _retry.to_status(error))
+
+    def test_transport_failures_report_unavailable(self):
+        self.assertTrue(
+            _retry.to_status(httpx.ConnectError("no route")).startswith(
+                "UNAVAILABLE: "
+            )
         )
 
-    def test_transport_failures_are_described(self):
-        status = _retry.to_status(httpx.ConnectError("no route"))
-        self.assertNotEqual(status, "RATE_LIMITED")
-        self.assertIn("UNAVAILABLE", status)
-
-    def test_status_is_never_empty(self):
-        self.assertTrue(_retry.to_status(_api_error(418, "", "")))
-
-
-class TestStatusMessages(unittest.TestCase):
-    """Failures that are not rate limiting are described in words."""
-
-    def test_request_errors_are_surfaced_verbatim(self):
-        error = _api_error(
-            400,
-            "INVALID_ARGUMENT",
-            "HTTP links are not supported for requests restricted by VPCSC.",
-        )
-        self.assertEqual(
-            _retry.to_status_message(error),
-            "INVALID_ARGUMENT: HTTP links are not supported for requests "
-            "restricted by VPCSC.",
-        )
-
-    def test_not_found_is_surfaced_verbatim(self):
-        error = _api_error(404, "NOT_FOUND", "Publisher Model was not found")
-        self.assertEqual(
-            _retry.to_status_message(error),
-            "NOT_FOUND: Publisher Model was not found",
-        )
-
-    def test_quota_messages_are_passed_through(self):
-        message = (
-            "Quota exceeded for metric aiplatform.googleapis.com/"
-            "generate_content_requests_per_minute_per_project"
-        )
-        error = _api_error(429, "RESOURCE_EXHAUSTED", message)
-        self.assertEqual(_retry.to_status_message(error), message)
-
-    def test_other_errors_are_summarised_as_retryable(self):
-        error = _api_error(429, "RESOURCE_EXHAUSTED", "too many requests")
-        self.assertEqual(
-            _retry.to_status_message(error),
-            "A retryable error occurred: RESOURCE_EXHAUSTED error from remote "
-            "service/endpoint.",
-        )
-
-    def test_server_errors_are_summarised_as_retryable(self):
-        error = _api_error(503, "UNAVAILABLE", "backend down")
-        self.assertEqual(
-            _retry.to_status_message(error),
-            "A retryable error occurred: UNAVAILABLE error from remote "
-            "service/endpoint.",
-        )
-
-    def test_transport_errors_report_unavailable(self):
-        self.assertEqual(
-            _retry.to_status_message(httpx.ConnectError("no route")),
-            "A retryable error occurred: UNAVAILABLE error from remote "
-            "service/endpoint.",
-        )
-
-    def test_status_is_never_empty(self):
-        error = _api_error(418, "", "")
-        self.assertTrue(_retry.to_status_message(error))
+    def test_an_unmapped_failure_is_still_described(self):
+        status = _retry.to_status(_api_error(418, "", ""))
+        self.assertTrue(status)
+        self.assertTrue(status.startswith("UNKNOWN: "))
 
 
 class TestFullJitterBackoff(unittest.TestCase):
