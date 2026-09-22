@@ -24,6 +24,88 @@ pip install dataproc-ml
 
 Here are a couple of examples demonstrating how to use the handlers for distributed inference on a Spark DataFrame.
 
+### AI Functions: `ai_generate`
+
+> **Note:** `ai_generate` makes API calls to Vertex AI, which will incur costs.
+> Please review the [Vertex AI Generative
+> AI pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing).
+
+`ai_generate` is a Spark column function that calls a Gemini model on every
+row. It always returns the same struct, whatever the arguments:
+
+```
+STRUCT<result STRING, full_response STRING, status STRING>
+```
+
+`result` is the generated text, `full_response` is the whole model response as
+JSON, and `status` is `SUCCESS`, `RATE_LIMITED`, `SAFETY_BLOCKED`, or a
+description of the error. A row that fails reports it in `status` rather than
+failing the query.
+
+```python
+from pyspark.sql import SparkSession, functions as F
+from google.cloud.dataproc_ml.sql import ai_generate
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.createDataFrame([("Paris",), ("Tokyo",)], ["city"])
+
+result_df = df.withColumn(
+    "generated",
+    ai_generate(F.concat(F.lit("Airport code for "), F.col("city"))),
+).select("city", "generated.result", "generated.status")
+
+result_df.show()
+# +-----+------+-------+
+# | city|result| status|
+# +-----+------+-------+
+# |Paris|   CDG|SUCCESS|
+# |Tokyo|   HND|SUCCESS|
+# +-----+------+-------+
+```
+
+Pass `output_schema` as a Spark DDL string to constrain the model to a shape.
+`result` then holds a JSON document matching it, which you can project with
+`from_json` when you want typed columns:
+
+```python
+schema = "sentiment STRING, score DOUBLE"
+
+df.withColumn(
+    "review",
+    ai_generate(F.col("text"), output_schema=schema),
+).select(F.from_json(F.col("review.result"), schema).alias("parsed"))
+```
+
+Model settings are passed as a JSON string matching the Vertex AI
+`generateContent` request body, so anything the API supports works without
+this library having to know about it:
+
+```python
+ai_generate(
+    F.col("text"),
+    model_params='{"generation_config": {"temperature": 0.0, "max_output_tokens": 512}}',
+)
+```
+
+The same function can be registered for use from Spark SQL, where the model
+settings are ordinary arguments and may be passed by name in any order:
+
+```python
+from google.cloud.dataproc_ml.sql import ai_generate_udf
+
+spark.udf.register("ai_generate", ai_generate_udf())
+
+spark.sql("""
+    SELECT ai_generate(
+        prompt => CONCAT('Airport code for ', city),
+        endpoint => 'gemini-3.6-flash',
+        output_schema => 'code STRING'
+    ).result
+    FROM cities
+""").show()
+```
+
 ### Generative AI (Gemini) Model Inference
 
 > **Note:** Using the `GenAiModelHandler` involves making API calls to 
