@@ -38,6 +38,7 @@ from pyspark.sql.types import (
 )
 
 from google.cloud.dataproc_ml.sql import _ddl
+from tests.utils.spark_version import requires_spark_4
 
 # The reference conversion, expressed against Spark's own parsed types. Keeping
 # it in the test rather than in the library is deliberate: it is the oracle the
@@ -121,7 +122,11 @@ class TestAgreesWithSpark(unittest.TestCase):
         # without one on an executor, which is why it exists.
         cls.spark = SparkSession.builder.master("local[1]").getOrCreate()
 
+    @requires_spark_4
     def test_matches_fromddl(self):
+        # StructType.fromDDL is the oracle and was added in PySpark 4, so on
+        # 3.5 there is nothing to compare against. The parser itself is
+        # version independent and its other tests still run.
         for schema in _AGREEING_SCHEMAS:
             with self.subTest(schema=schema):
                 expected = _reference_schema(StructType.fromDDL(schema))

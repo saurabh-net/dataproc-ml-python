@@ -30,8 +30,12 @@ Here are a couple of examples demonstrating how to use the handlers for distribu
 > Please review the [Vertex AI Generative
 > AI pricing](https://cloud.google.com/vertex-ai/generative-ai/pricing).
 
-> **Note:** The AI functions require Apache Spark 4.0 or later. Named arguments
-> in Spark SQL, which the call style below relies on, do not exist before it.
+> **Note:** The AI functions work on Apache Spark 3.5 and later. The only thing
+> that needs Spark 4 is `parse_json` on `full_response`. Spark SQL settings
+> travel in a struct rather than as `name => value` named arguments, because
+> named arguments do not reach a Python UDF before Spark 4.0 — the query fails
+> at run time with `[INTERNAL_ERROR] Cannot evaluate expression`. Named
+> arguments do work on Spark 4 for anyone who prefers them.
 
 `ai_generate` is a Spark column function that calls a Gemini model on every
 row. It always returns the same struct, whatever the arguments:
@@ -57,7 +61,7 @@ df = spark.createDataFrame([("Paris",), ("Tokyo",)], ["city"])
 
 result_df = df.withColumn(
     "generated",
-    ai_generate(F.concat(F.lit("Airport code for "), F.col("city"))),
+    ai_generate([F.lit("Airport code for "), F.col("city")]),
 ).select("city", "generated.result", "generated.status")
 
 result_df.show()
@@ -67,6 +71,17 @@ result_df.show()
 # |Paris|   CDG|      |
 # |Tokyo|   HND|      |
 # +-----+------+------+
+```
+
+`full_response` is a JSON string, so it is readable on every supported
+version. On Spark 4 you can also query inside it without leaving SQL:
+
+```python
+# Spark 4 only: parse_json and variant_get were added in 4.0.
+df.withColumn("generated", ai_generate(F.col("city"))).selectExpr(
+    "variant_get(parse_json(generated.full_response),"
+    " '$.usage_metadata.total_token_count', 'int') AS tokens"
+)
 ```
 
 Pass `output_schema` as a Spark DDL string to constrain the model to a shape.
@@ -120,8 +135,10 @@ literal path in `F.lit`.
 
 #### Spark SQL
 
-The same function can be registered for use from Spark SQL, where the model
-settings are ordinary arguments and may be passed by name in any order:
+The same function can be registered for use from Spark SQL. The call is
+`ai_generate(prompt [, endpoint] [, options])`; trailing arguments may be left
+out, and the `options` struct names each setting, so they can be written in any
+order and omitted individually:
 
 ```python
 from google.cloud.dataproc_ml.sql import ai_generate_udf
@@ -130,13 +147,25 @@ spark.udf.register("ai_generate", ai_generate_udf())
 
 spark.sql("""
     SELECT ai_generate(
-        prompt => CONCAT('Airport code for ', city),
-        endpoint => 'gemini-3.6-flash',
-        output_schema => 'code STRING'
+        CONCAT('Airport code for ', city),
+        'gemini-3.6-flash',
+        named_struct('output_schema', 'code STRING')
     ).result
     FROM cities
 """).show()
 ```
+
+`ai_generate(body)` is a complete call. Because `endpoint` is a string and
+`options` is a struct, the two are told apart by type, so there is never a
+`NULL` to pad with:
+
+```sql
+SELECT ai_generate(body, named_struct('output_schema', 'code STRING')).result
+FROM cities
+```
+
+A name that is not a setting is an error rather than being ignored, so a typo
+cannot quietly do nothing.
 
 In SQL a prompt is either a string or a struct whose fields are, in order, the
 parts of the prompt. A field holding `named_struct('uri', ...)` is a file, and
@@ -146,9 +175,9 @@ a top-level `named_struct('uri', ...)` is itself a single file:
 SELECT g.result
 FROM (
     SELECT ai_generate(
-        prompt => struct('Extract the invoice details.',
-                         named_struct('uri', uri)),
-        output_schema => 'invoice_number STRING, total DOUBLE'
+        struct('Extract the invoice details.',
+               named_struct('uri', uri)),
+        named_struct('output_schema', 'invoice_number STRING, total DOUBLE')
     ) AS g
     FROM invoices
 )

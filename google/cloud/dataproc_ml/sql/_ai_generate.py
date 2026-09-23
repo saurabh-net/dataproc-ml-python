@@ -92,6 +92,18 @@ _BLOCKED_FINISH_REASONS = frozenset(
 # tell a literal from a column at plan time, so constancy is checked here.
 _CONSTANT_ARGUMENTS = ("endpoint", "model_params", "output_schema")
 
+MODEL_PARAMS_OPTION = "model_params"
+OUTPUT_SCHEMA_OPTION = "output_schema"
+
+#: The names allowed inside the ``options`` struct in Spark SQL.
+#:
+#: Settings travel in a struct rather than as named arguments because named
+#: arguments do not reach a Python UDF before Spark 4.0: the analyzer leaves
+#: the ``NamedArgumentExpression`` in place and it fails at run time with
+#: ``[INTERNAL_ERROR] Cannot evaluate expression``. A struct carries the same
+#: names positionally, so one spelling works on every supported version.
+OPTION_NAMES = (MODEL_PARAMS_OPTION, OUTPUT_SCHEMA_OPTION)
+
 
 @dataclasses.dataclass(frozen=True)
 class FilePart:
@@ -163,7 +175,9 @@ def ai_generate(
         <https://cloud.google.com/vertex-ai/generative-ai/pricing>`_ page.
 
     .. note::
-        Requires Apache Spark 4.0 or later.
+        Works on Apache Spark 3.5 and later. Passing a ``StructType`` for
+        ``output_schema`` is rendered here rather than by Spark, so it works
+        on 3.5 too; only ``parse_json(full_response)`` needs Spark 4.
 
     Args:
         prompt: The prompt column, the name of a prompt column, a
@@ -230,14 +244,15 @@ def ai_generate(
         location=location,
         _generate_content=_generate_content,
     )
-    # An unset argument is passed as a typed NULL rather than left out, so
-    # that the executor always sees the same four columns. Without the cast an
-    # unset one would be a void column, which is not a string.
+    # The settings are passed as a struct rather than as separate columns so
+    # that the executor sees exactly the signature a Spark SQL caller uses.
+    # Unset fields are typed NULLs rather than omitted, so the worker always
+    # receives the same three columns; without the cast an unset one would be
+    # a void column, which is not a string.
     return generate(
         _to_prompt_column(prompt),
         sf.lit(endpoint).cast(StringType()),
-        sf.lit(model_params_json).cast(StringType()),
-        sf.lit(output_schema_ddl).cast(StringType()),
+        _to_options_column(model_params_json, output_schema_ddl),
     )
 
 
@@ -252,19 +267,39 @@ def ai_generate_udf(
         >>> spark.udf.register("ai_generate", ai_generate_udf())
         >>> spark.sql('''
         ...     SELECT ai_generate(
-        ...         prompt => concat('Summarize: ', body),
-        ...         endpoint => 'gemini-3.6-flash',
-        ...         output_schema => 'summary STRING, sentiment STRING'
+        ...         concat('Summarize: ', body),
+        ...         'gemini-3.6-flash',
+        ...         named_struct('output_schema', 'summary STRING')
         ...     ).result
         ...     FROM articles
         ... ''')
 
-    Unlike :func:`ai_generate`, the model settings are not fixed when the
-    function is built. They are ordinary arguments, so they may be omitted or
-    passed by name in any order — which requires Apache Spark 4.0 or later.
-    They must still be constant for the query: ``endpoint``, ``model_params``
-    and ``output_schema`` describe the call, not the row, and a value that
-    varies from row to row fails the query.
+    The signature is ``ai_generate(prompt [, endpoint] [, options])``. Every
+    argument is positional, and trailing ones may simply be left out:
+    ``ai_generate(body)`` is a complete call.
+
+    Settings travel in the ``options`` struct, named by its field names, which
+    may appear in any order and be omitted individually. A name that is not a
+    setting is an error rather than being ignored, so a typo cannot silently
+    do nothing::
+
+        named_struct('output_schema', 'a STRING', 'model_params', '{"topP":1}')
+
+    ``options`` may take the place of ``endpoint`` when only it is needed, so
+    there is never a NULL to pad with::
+
+        ai_generate(body, named_struct('output_schema', 'a STRING'))
+
+    A struct is used instead of named arguments because ``name => value`` does
+    not reach a Python UDF before Spark 4.0. The analyzer leaves the
+    ``NamedArgumentExpression`` unresolved and the query fails at run time with
+    ``[INTERNAL_ERROR] Cannot evaluate expression``. Named arguments still work
+    on Spark 4.0 for callers who prefer them, since the parameters are named
+    ``prompt``, ``endpoint`` and ``options``.
+
+    ``endpoint`` and the ``options`` fields must be constant for the query:
+    they describe the call, not the row, so a value that varies from row to
+    row fails the query.
 
     ``prompt`` is the one argument that varies. It is either a string or a
     struct whose fields are, in order, the parts of the prompt: a string field
@@ -281,15 +316,14 @@ def ai_generate_udf(
 
     Returns:
         A pandas user defined function taking ``prompt`` and, optionally,
-        ``endpoint``, ``model_params`` and ``output_schema``.
+        ``endpoint`` and ``options``.
     """
 
     @pandas_udf(RETURN_TYPE)
     def _generate(
         prompt: Union[pd.Series, pd.DataFrame],
-        endpoint: pd.Series = None,
-        model_params: pd.Series = None,
-        output_schema: pd.Series = None,
+        endpoint: Union[pd.Series, pd.DataFrame] = None,
+        options: Union[pd.Series, pd.DataFrame] = None,
     ) -> pd.DataFrame:
         """Runs on the executor, once per Arrow batch.
 
@@ -301,12 +335,14 @@ def ai_generate_udf(
         A struct prompt arrives as a ``pandas.DataFrame`` with one column per
         field; a string prompt arrives as a ``pandas.Series``.
         """
+        endpoint, options = _split_settings(endpoint, options)
         model = _constant(endpoint, "endpoint") or DEFAULT_ENDPOINT
         # A malformed setting is a mistake in the query, not a property of a
         # row, so it is raised rather than written to every row's status.
+        settings = _to_options(options)
         config = _resolve_config(
-            _constant(model_params, "model_params"),
-            _constant(output_schema, "output_schema"),
+            settings.get(MODEL_PARAMS_OPTION),
+            settings.get(OUTPUT_SCHEMA_OPTION),
         )
 
         if _generate_content is not None:
@@ -329,6 +365,101 @@ def ai_generate_udf(
         return pd.DataFrame(rows, columns=_RETURN_FIELDS, index=prompt.index)
 
     return _generate
+
+
+def _split_settings(second, third):
+    """Sorts the two optional arguments into ``endpoint`` and ``options``.
+
+    ``endpoint`` is always a string and ``options`` is always a struct, so the
+    two can be told apart by what arrived. That is what lets a caller who only
+    wants options skip ``endpoint`` without padding the call with a NULL::
+
+        ai_generate(body, named_struct('output_schema', 'a STRING'))
+
+    Args:
+        second: Whatever was passed in the second position, or None.
+        third: Whatever was passed in the third position, or None.
+
+    Returns:
+        A pair of (endpoint, options), either of which may be None.
+
+    Raises:
+        ValueError: If a struct was passed in the second position and
+            something was passed in the third as well, which would mean two
+            options structs.
+    """
+    if isinstance(second, pd.DataFrame):
+        if third is not None:
+            raise ValueError(
+                "ai_generate takes options once. The second argument is "
+                "already a struct, so the third cannot be given. The call is "
+                "ai_generate(prompt, endpoint, options), and endpoint may be "
+                "left out."
+            )
+        return None, second
+    return second, third
+
+
+def _to_options(options) -> Dict[str, Optional[str]]:
+    """Reads the settings out of the ``options`` struct.
+
+    The field names are the setting names, so they may be written in any order
+    and any of them left out. An unrecognized name is rejected rather than
+    ignored: silently doing nothing in response to a typo is how a caller ends
+    up believing a setting took effect when it did not.
+
+    Args:
+        options: The options column: a DataFrame for a struct, a Series if the
+            caller wrote NULL, or None if the argument was omitted.
+
+    Returns:
+        The settings that were given, by name.
+
+    Raises:
+        ValueError: If the argument is not a struct, or names something that
+            is not a setting.
+    """
+    if options is None:
+        return {}
+    allowed = ", ".join(OPTION_NAMES)
+    if not isinstance(options, pd.DataFrame):
+        # A bare NULL in this position is how a caller spells "no options".
+        if options.isna().all():
+            return {}
+        raise ValueError(
+            "The third argument to ai_generate must be a struct of settings, "
+            f"such as named_struct({OUTPUT_SCHEMA_OPTION!r}, 'a STRING'). "
+            f"Allowed names are {allowed}."
+        )
+
+    unknown = [name for name in options.columns if name not in OPTION_NAMES]
+    if unknown:
+        listed = ", ".join(sorted(unknown))
+        raise ValueError(
+            f"Unknown option(s) {listed} passed to ai_generate. Allowed "
+            f"names are {allowed}. Note that named_struct() names its fields "
+            "positionally, so a field built without a name will not match."
+        )
+    return {
+        name: _constant(options[name], f"options.{name}")
+        for name in options.columns
+    }
+
+
+def _to_options_column(
+    model_params_json: Optional[str], output_schema_ddl: Optional[str]
+) -> Column:
+    """Builds the options struct that :func:`ai_generate` passes to the UDF.
+
+    Both fields are always present, as typed NULLs when unset, so that the
+    executor sees one shape no matter which settings were given.
+    """
+    return sf.struct(
+        sf.lit(model_params_json).cast(StringType()).alias(MODEL_PARAMS_OPTION),
+        sf.lit(output_schema_ddl)
+        .cast(StringType())
+        .alias(OUTPUT_SCHEMA_OPTION),
+    )
 
 
 def _constant(argument: Optional[pd.Series], name: str) -> Optional[str]:
@@ -415,20 +546,48 @@ def _to_output_schema_ddl(
 ) -> Optional[str]:
     """Renders the ``output_schema`` argument as a DDL string.
 
-    A ``StructType`` is accepted for convenience in Python and rendered with
-    Spark's own ``toDDL``, so that the executor only ever sees DDL and only
-    one parser has to agree with Spark.
+    A ``StructType`` is accepted for convenience in Python and rendered here,
+    so that the executor only ever sees DDL and only one parser has to agree
+    with Spark.
     """
     if output_schema is None:
         return None
     if isinstance(output_schema, str):
         return output_schema
     if isinstance(output_schema, StructType):
-        return output_schema.toDDL()
+        return _struct_to_ddl(output_schema)
     raise ValueError(
         "output_schema must be a DDL string or a pyspark StructType, got "
         f"{type(output_schema).__name__}."
     )
+
+
+def _struct_to_ddl(schema: StructType) -> str:
+    """Renders a ``StructType`` as the DDL the UDF takes.
+
+    ``StructType.toDDL`` would do this, but it was only added in PySpark 4 and
+    this library supports 3.5. Rendering it here also means the string is the
+    same on every version, rather than whatever the local Spark produces. A
+    test asserts this agrees with ``toDDL`` where that exists.
+    """
+    return ", ".join(
+        " ".join(
+            part
+            for part in (
+                _quote_field_name(field.name),
+                field.dataType.simpleString(),
+                "" if field.nullable else "NOT NULL",
+            )
+            if part
+        )
+        for field in schema.fields
+    )
+
+
+def _quote_field_name(name: str) -> str:
+    """Backquotes a field name so that any name survives the round trip."""
+    escaped = name.replace("`", "``")
+    return f"`{escaped}`"
 
 
 @functools.lru_cache(maxsize=_CONFIG_CACHE_SIZE)

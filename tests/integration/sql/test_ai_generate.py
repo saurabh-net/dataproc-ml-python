@@ -32,6 +32,7 @@ from pyspark.sql import functions as sf
 
 from google.cloud.dataproc_ml.sql import _client
 from google.cloud.dataproc_ml.sql import ai_generate, ai_generate_udf, file
+from tests.utils.spark_version import requires_spark_4
 
 _AIRPORT_PROMPT = (
     "What is the airport code of the largest airport in {city}? "
@@ -128,6 +129,7 @@ class TestAiGenerate(unittest.TestCase):
         self.assertIn("candidates", payload)
         self.assertIn("usage_metadata", payload)
 
+    @requires_spark_4
     def test_full_response_can_be_queried_with_parse_json(self):
         # The field is a string, so anything structural goes through
         # parse_json. This is the documented way to reach inside it.
@@ -289,18 +291,20 @@ class TestAiGenerate(unittest.TestCase):
         for row in rows:
             self.assertIsNotNone(row["code"])
 
-    def test_spark_sql_with_named_arguments(self):
+    def test_spark_sql_with_options(self):
         # The call style the spec uses, end to end against the real model.
         self.spark.udf.register("ai_generate", ai_generate_udf())
         self.cities.createOrReplaceTempView("cities")
 
         rows = self.spark.sql(
             "SELECT city, expected, ai_generate("
-            "  prompt => CONCAT('Airport code of the largest airport in ',"
-            "                   city, '? Three letters only.'),"
-            "  endpoint => 'gemini-3.6-flash',"
-            f"  model_params => '{_DETERMINISTIC}',"
-            "  output_schema => 'code STRING'"
+            "  CONCAT('Airport code of the largest airport in ',"
+            "         city, '? Three letters only.'),"
+            "  'gemini-3.6-flash',"
+            "  named_struct("
+            f"    'model_params', '{_DETERMINISTIC}',"
+            "     'output_schema', 'code STRING'"
+            "  )"
             ") AS g FROM cities"
         ).collect()
 
@@ -310,6 +314,44 @@ class TestAiGenerate(unittest.TestCase):
                 self.assertEqual(row["g"]["status"], "")
                 parsed = json.loads(row["g"]["result"])
                 self.assertIn(row["expected"], parsed["code"].upper())
+
+    def test_options_may_replace_endpoint(self):
+        # endpoint is a string and options is a struct, so they are told apart
+        # by type and a caller never has to write a NULL placeholder.
+        self.spark.udf.register("ai_generate", ai_generate_udf())
+        self.cities.limit(2).createOrReplaceTempView("few_cities")
+
+        rows = self.spark.sql(
+            "SELECT city, expected, ai_generate("
+            "  CONCAT('Airport code of the largest airport in ',"
+            "         city, '? Three letters only.'),"
+            "  named_struct("
+            f"    'model_params', '{_DETERMINISTIC}',"
+            "     'output_schema', 'code STRING'"
+            "  )"
+            ") AS g FROM few_cities"
+        ).collect()
+
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            with self.subTest(city=row["city"]):
+                self.assertEqual(row["g"]["status"], "")
+                parsed = json.loads(row["g"]["result"])
+                self.assertIn(row["expected"], parsed["code"].upper())
+
+    def test_an_unknown_option_fails_the_query(self):
+        # A typo must not look like a setting that quietly took effect.
+        self.spark.udf.register("ai_generate", ai_generate_udf())
+        self.cities.createOrReplaceTempView("cities")
+
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate(city,"
+                " named_struct('output_schemaa', 'code STRING')).result AS r"
+                " FROM cities"
+            ).collect()
+
+        self.assertIn("output_schemaa", str(caught.exception))
 
     def test_a_setting_that_varies_per_row_fails_the_query(self):
         # endpoint, model_params and output_schema configure the call, not the
@@ -328,8 +370,9 @@ class TestAiGenerate(unittest.TestCase):
         with self.assertRaises(Exception) as caught:
             self.spark.sql(
                 "SELECT ai_generate("
-                "  prompt => CONCAT('Capital of ', country, '?'),"
-                "  output_schema => schema"
+                "  CONCAT('Capital of ', country, '?'),"
+                "  NULL,"
+                "  named_struct('output_schema', schema)"
                 ").result AS r FROM questions"
             ).collect()
 
@@ -475,11 +518,11 @@ class TestMultimodalPrompts(unittest.TestCase):
 
         row = self.spark.sql(
             "SELECT ai_generate("
-            "  prompt => struct("
+            "  struct("
             "    'What brand name is on the label? Brand name only.',"
             "    named_struct('uri', uri)"
             "  ),"
-            f"  model_params => '{_DETERMINISTIC}'"
+            f"  named_struct('model_params', '{_DETERMINISTIC}')"
             ") AS g FROM documents"
         ).first()
 
@@ -494,11 +537,11 @@ class TestMultimodalPrompts(unittest.TestCase):
 
         row = self.spark.sql(
             "SELECT ai_generate("
-            "  prompt => struct("
+            "  struct("
             "    'What is the invoice number? Digits only.',"
             "    named_struct('uri', uri, 'content_type', 'application/pdf')"
             "  ),"
-            f"  model_params => '{_DETERMINISTIC}'"
+            f"  named_struct('model_params', '{_DETERMINISTIC}')"
             ") AS g FROM documents"
         ).first()
 

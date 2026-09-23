@@ -16,7 +16,7 @@
 
 These functions apply Google's Gemini models to a DataFrame column without any
 of the usual plumbing: no client setup, no retry loops and no response
-parsing. They require Apache Spark 4.0 or later.
+parsing. They work on Apache Spark 3.5 and later.
 
 Example:
     >>> from pyspark.sql.functions import col
@@ -34,16 +34,17 @@ A prompt may include a file, which Vertex AI reads directly:
     ...     "g", ai_generate([lit("Describe this image."), file(col("uri"))])
     ... )
 
-The same function can be registered for use from Spark SQL, where the model
-settings are ordinary arguments and may be passed by name:
+The same function can be registered for use from Spark SQL, where the call is
+``ai_generate(prompt [, endpoint] [, options])`` and the settings travel in
+the ``options`` struct:
 
     >>> from google.cloud.dataproc_ml.sql import ai_generate_udf
     >>>
     >>> spark.udf.register("ai_generate", ai_generate_udf())
     >>> spark.sql('''
     ...     SELECT ai_generate(
-    ...         prompt => concat('Summarize: ', feedback),
-    ...         output_schema => 'summary STRING, sentiment STRING'
+    ...         concat('Summarize: ', feedback),
+    ...         named_struct('output_schema', 'summary STRING')
     ...     ).result
     ...     FROM feedback_table
     ... ''')

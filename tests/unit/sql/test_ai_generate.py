@@ -33,6 +33,7 @@ from pyspark.sql.types import (
 # pylint: disable=ungrouped-imports
 from google.cloud.dataproc_ml.sql import _ai_generate as ai_generate_module
 from google.cloud.dataproc_ml.sql import ai_generate, ai_generate_udf, file
+from tests.utils.spark_version import requires_spark_4
 
 # pylint: enable=ungrouped-imports
 
@@ -754,6 +755,7 @@ class TestSparkExecution(SparkTestCase):
         # The null-prompt row never calls the model, so it succeeds.
         self.assertEqual(failed, 3)
 
+    @requires_spark_4
     def test_full_response_can_be_parsed_back_into_json(self):
         # The spec fixes the field as a string; parse_json recovers a VARIANT
         # for anyone who wants to query inside it.
@@ -768,7 +770,7 @@ class TestSparkExecution(SparkTestCase):
         )
         self.assertEqual(result.first()["role"], "model")
 
-    def test_registered_for_spark_sql_with_named_arguments(self):
+    def test_registered_for_spark_sql(self):
         self.spark.udf.register(
             "ai_generate",
             ai_generate_udf(_generate_content=echoes_the_request()),
@@ -777,9 +779,9 @@ class TestSparkExecution(SparkTestCase):
 
         row = self.spark.sql(
             "SELECT ai_generate("
-            "  prompt => body,"
-            "  endpoint => 'gemini-2.5-pro',"
-            "  output_schema => 'sentiment STRING'"
+            "  body,"
+            "  'gemini-2.5-pro',"
+            "  named_struct('output_schema', 'sentiment STRING')"
             ").result AS r FROM documents WHERE id = 1"
         ).first()
 
@@ -794,7 +796,9 @@ class TestSparkExecution(SparkTestCase):
             },
         )
 
-    def test_named_arguments_may_be_reordered_and_omitted(self):
+    def test_options_may_be_reordered(self):
+        # The struct's field names carry the meaning, so the order they are
+        # written in must not matter.
         self.spark.udf.register(
             "ai_generate",
             ai_generate_udf(_generate_content=echoes_the_request()),
@@ -802,13 +806,102 @@ class TestSparkExecution(SparkTestCase):
         self._documents().createOrReplaceTempView("documents")
 
         row = self.spark.sql(
-            "SELECT ai_generate(output_schema => 'a STRING', prompt => body)"
-            ".result AS r FROM documents WHERE id = 1"
+            "SELECT ai_generate(body, 'gemini-2.5-pro', named_struct("
+            "  'output_schema', 'a STRING',"
+            "  'model_params', '{\"temperature\": 0.5}'"
+            ")).result AS r FROM documents WHERE id = 1"
+        ).first()
+
+        request = json.loads(row["r"])
+        self.assertIsNotNone(request["response_schema"])
+        self.assertEqual(request["temperature"], 0.5)
+
+    def test_options_may_replace_endpoint(self):
+        # endpoint is a string and options is a struct, so a caller who wants
+        # only options does not have to pad the call with a NULL.
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self._documents().createOrReplaceTempView("documents")
+
+        row = self.spark.sql(
+            "SELECT ai_generate(body, named_struct("
+            "  'output_schema', 'a STRING'"
+            ")).result AS r FROM documents WHERE id = 1"
         ).first()
 
         request = json.loads(row["r"])
         self.assertEqual(request["model"], ai_generate_module.DEFAULT_ENDPOINT)
         self.assertIsNotNone(request["response_schema"])
+
+    def test_the_prompt_alone_is_a_complete_call(self):
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self._documents().createOrReplaceTempView("documents")
+
+        row = self.spark.sql(
+            "SELECT ai_generate(body).result AS r FROM documents WHERE id = 1"
+        ).first()
+
+        request = json.loads(row["r"])
+        self.assertEqual(request["model"], ai_generate_module.DEFAULT_ENDPOINT)
+        self.assertIsNone(request["response_schema"])
+
+    def test_an_unknown_option_fails_the_query(self):
+        # Ignoring a name we do not know would let a typo look like a setting
+        # that took effect.
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self._documents().createOrReplaceTempView("documents")
+
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate(body, named_struct("
+                "  'output_schemaa', 'a STRING'"
+                ")).result AS r FROM documents"
+            ).collect()
+        message = str(caught.exception)
+        self.assertIn("output_schemaa", message)
+        self.assertIn("output_schema", message)
+
+    def test_explicit_nulls_mean_the_defaults(self):
+        # Omitting an argument and writing NULL arrive differently on the
+        # executor, and must not behave differently.
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self._documents().createOrReplaceTempView("documents")
+
+        row = self.spark.sql(
+            "SELECT ai_generate(body, NULL, NULL).result AS r"
+            " FROM documents WHERE id = 1"
+        ).first()
+
+        request = json.loads(row["r"])
+        self.assertEqual(request["model"], ai_generate_module.DEFAULT_ENDPOINT)
+        self.assertIsNone(request["response_schema"])
+
+    def test_options_cannot_be_given_twice(self):
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self._documents().createOrReplaceTempView("documents")
+
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate(body,"
+                "  named_struct('output_schema', 'a STRING'),"
+                "  named_struct('model_params', '{}')"
+                ").result AS r FROM documents"
+            ).collect()
+        self.assertIn("options", str(caught.exception))
 
     def test_a_bad_setting_from_sql_fails_the_query(self):
         # A mistake in the query is not a property of a row: it must not cost
@@ -821,8 +914,9 @@ class TestSparkExecution(SparkTestCase):
 
         with self.assertRaises(Exception) as caught:
             self.spark.sql(
-                "SELECT ai_generate(prompt => body,"
-                " output_schema => 'a NOTATYPE').status AS s FROM documents"
+                "SELECT ai_generate(body, NULL,"
+                " named_struct('output_schema', 'a NOTATYPE')).status AS s"
+                " FROM documents"
             ).collect()
         self.assertIn("NOTATYPE", str(caught.exception))
 
@@ -840,10 +934,28 @@ class TestSparkExecution(SparkTestCase):
 
         with self.assertRaises(Exception) as caught:
             self.spark.sql(
-                "SELECT ai_generate(prompt => body, endpoint => model).result"
-                " AS r FROM varying"
+                "SELECT ai_generate(body, model).result AS r FROM varying"
             ).collect()
         self.assertIn("endpoint", str(caught.exception))
+
+    def test_an_option_that_varies_per_row_fails_the_query(self):
+        # The same rule has to hold for a setting inside the options struct.
+        self.spark.udf.register(
+            "ai_generate",
+            ai_generate_udf(_generate_content=echoes_the_request()),
+        )
+        self.spark.createDataFrame(
+            [("a", "x STRING"), ("b", "y STRING")],
+            "body STRING, schema STRING",
+        ).repartition(1).createOrReplaceTempView("varying_options")
+
+        with self.assertRaises(Exception) as caught:
+            self.spark.sql(
+                "SELECT ai_generate(body, NULL,"
+                " named_struct('output_schema', schema)).result AS r"
+                " FROM varying_options"
+            ).collect()
+        self.assertIn("output_schema", str(caught.exception))
 
     def test_a_repeated_column_value_is_accepted(self):
         # A literal and a column that happens to repeat are indistinguishable
@@ -858,8 +970,7 @@ class TestSparkExecution(SparkTestCase):
         ).createOrReplaceTempView("constant")
 
         rows = self.spark.sql(
-            "SELECT ai_generate(prompt => body, endpoint => model).result AS r"
-            " FROM constant"
+            "SELECT ai_generate(body, model).result AS r FROM constant"
         ).collect()
 
         self.assertEqual(
@@ -999,7 +1110,7 @@ class TestMultimodalPrompts(SparkTestCase):
 
         rows = self.spark.sql(
             "SELECT ai_generate("
-            "  prompt => struct('Summarize: ', named_struct('uri', uri))"
+            "  struct('Summarize: ', named_struct('uri', uri))"
             ").result AS r FROM files ORDER BY uri"
         ).collect()
 
